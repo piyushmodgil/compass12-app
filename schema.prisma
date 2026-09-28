@@ -1,0 +1,547 @@
+// Compass12 — Career Assessment Platform
+// Phase 1: Database schema (PostgreSQL via Prisma)
+//
+// Design notes:
+// - Reference/config data (Question, QuestionOption, AssessmentFactor, CareerCluster,
+//   Course) uses the SAME business ids already present in question_bank.json
+//   (e.g. "INT001", "int_tech", "ENG", "CRS001") as the primary key. This lets us seed
+//   directly from the existing question bank / assessment_engine.py without inventing
+//   a parallel id scheme, and keeps admin-authored content human-readable.
+// - Transactional/session data (AssessmentSession, Answer, FactorScore, CareerScore,
+//   Report, Lead, AnalyticsEvent) uses cuid() surrogate keys — high volume, no natural key.
+// - Scoring weights (ScoringRule, EngineConfig) are DATA, not code, so the deterministic
+//   Answer -> FactorScore -> CareerScore -> Recommendation pipeline (see
+//   assessment_engine.py) can be tuned from the admin panel without a redeploy.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")   // pooled connection (Neon/Vercel Postgres pooler)
+  directUrl = env("DIRECT_URL")     // direct connection, used for migrations
+}
+
+// ============================================================================
+// AUTH (Auth.js / NextAuth-compatible core tables)
+// ============================================================================
+
+enum UserRole {
+  STUDENT
+  ADMIN
+  COUNSELLOR
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+  role          UserRole  @default(STUDENT)
+  passwordHash  String? // only set for credentials-based admin/counsellor logins
+
+  createdAt DateTime @updatedAt @default(now())
+  updatedAt DateTime @updatedAt
+
+  accounts Account[]
+  sessions Session[]
+  student  Student?
+  admin    AdminUser?
+
+  @@index([role])
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ============================================================================
+// STUDENTS & ADMIN PROFILES
+// ============================================================================
+
+enum Stream {
+  PCM
+  PCB
+  PCMB
+  COMMERCE
+  ARTS
+}
+
+model Student {
+  id       String  @id @default(cuid())
+  userId   String? @unique // nullable: a student can take the assessment as a guest
+  fullName String
+  mobile   String
+  email    String
+  class    String // e.g. "11", "12"
+  stream   Stream
+  school   String
+  city     String
+  dob      DateTime?
+
+  consentAt DateTime // consent checkbox timestamp — required before any PII is stored
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user               User?               @relation(fields: [userId], references: [id], onDelete: SetNull)
+  assessmentSessions AssessmentSession[]
+  leads              Lead[]
+
+  @@index([mobile])
+  @@index([email])
+  @@index([createdAt])
+}
+
+enum AdminRole {
+  SUPER_ADMIN
+  CONTENT_EDITOR
+  COUNSELLOR_ADMIN
+}
+
+model AdminUser {
+  id     String    @id @default(cuid())
+  userId String    @unique
+  role   AdminRole @default(CONTENT_EDITOR)
+
+  createdAt DateTime @default(now())
+
+  user           User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assignedLeads  Lead[] @relation("LeadAssignedAdmin")
+
+  @@index([role])
+}
+
+// ============================================================================
+// ASSESSMENT FACTORS (dimensions) — int_tech, sub_math, apt_logical, ws_solo, ...
+// ============================================================================
+
+enum FactorCategory {
+  INTEREST
+  PERSONALITY
+  SUBJECT
+  APTITUDE
+  WORK_STYLE
+}
+
+model AssessmentFactor {
+  id       String         @id // e.g. "int_tech", "sub_math", "ws_solo"
+  category FactorCategory
+  label    String // e.g. "interest in technology" (dim_labels.json)
+  isActive Boolean        @default(true)
+
+  // Bipolar dimensions are scored on a single sliding scale (e.g. ws_solo <-> ws_team).
+  // Only one side of the pair stores this pointer; NULL means the factor is unipolar.
+  bipolarPairId String?             @unique
+  bipolarPair   AssessmentFactor?   @relation("BipolarPair", fields: [bipolarPairId], references: [id])
+  bipolarPairOf AssessmentFactor?   @relation("BipolarPair")
+
+  optionWeights OptionFactorWeight[]
+  scoringRules  ScoringRule[]
+  courseKeyDims CourseKeyDimension[]
+  factorScores  FactorScore[]
+
+  @@index([category])
+}
+
+// ============================================================================
+// QUESTIONS & OPTIONS
+// ============================================================================
+
+enum QuestionType {
+  SINGLE_CHOICE
+  MULTI_CHOICE
+  SCALE
+}
+
+model Question {
+  id       String       @id // e.g. "INT001" — matches question_bank.json question ids
+  category String // "Interests" | "Hobbies & Activities" | "Personality" | ... (kept as
+  // a String, not an enum, so admins can rename/reorder categories without a migration)
+  factor   String // short internal grouping label, e.g. "Interest domains"
+  text     String       @db.Text
+  type     QuestionType @default(SINGLE_CHOICE)
+  order    Int          @default(0)
+  isActive Boolean      @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  options QuestionOption[]
+  answers Answer[]
+
+  @@index([category])
+  @@index([isActive, order])
+}
+
+model QuestionOption {
+  id           String  @id @default(cuid())
+  questionId   String
+  text         String
+  order        Int     @default(0)
+  isNoneOption Boolean @default(false) // maps to question_bank.json option.none === true
+
+  question Question             @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  dims     OptionFactorWeight[]
+  answers  Answer[]
+
+  @@index([questionId])
+}
+
+// Join table: which factors an option contributes to, and how strongly.
+// Mirrors question_bank.json's option.dims[] array, with weight defaulting to 1
+// so multi-dim options can later be tuned (e.g. a primary dim at 1.0, a secondary at 0.5).
+model OptionFactorWeight {
+  optionId String
+  factorId String
+  weight   Decimal @default(1) @db.Decimal(4, 2)
+
+  option QuestionOption   @relation(fields: [optionId], references: [id], onDelete: Cascade)
+  factor AssessmentFactor @relation(fields: [factorId], references: [id], onDelete: Cascade)
+
+  @@id([optionId, factorId])
+  @@index([factorId])
+}
+
+// ============================================================================
+// ASSESSMENT SESSIONS, ANSWERS, AUTOSAVE / RESUME
+// ============================================================================
+
+enum AssessmentMode {
+  QUICK // modes.quick — 15 questions
+  DETAILED // modes.detailed — 30 questions
+}
+
+enum SessionStatus {
+  IN_PROGRESS
+  COMPLETED
+  ABANDONED
+}
+
+model AssessmentSession {
+  id        String         @id @default(cuid())
+  studentId String
+  mode      AssessmentMode @default(DETAILED)
+  status    SessionStatus  @default(IN_PROGRESS)
+
+  // Frozen at session start so a later change to question_bank.json / blueprint config
+  // never alters an in-flight or already-scored assessment.
+  streamSnapshot   Stream
+  blueprintSnapshot Json
+  questionOrder    Json // ordered array of Question.id chosen for this session (coverage-balanced)
+
+  totalQuestions      Int
+  currentQuestionIndex Int      @default(0) // resume pointer
+  resumeToken          String   @unique @default(cuid()) // opaque token for "resume my assessment" links
+
+  startedAt      DateTime  @default(now())
+  lastActivityAt DateTime  @updatedAt
+  completedAt    DateTime?
+
+  student       Student        @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  answers       Answer[]
+  factorScores  FactorScore[]
+  careerScores  CareerScore[]
+  careerProfile CareerProfile?
+  report        Report?
+  leads         Lead[]
+  events        AnalyticsEvent[]
+
+  @@index([studentId])
+  @@index([status])
+  @@index([startedAt])
+}
+
+model Answer {
+  id       String  @id @default(cuid())
+  sessionId String
+  questionId String
+  selectedOptionId String? // nullable: student skipped / picked "none of these"
+
+  questionIndex Int // position within this session's questionOrder, for autosave/resume
+  answeredAt    DateTime @default(now())
+  responseMs    Int? // time taken to answer, optional UX/analytics signal
+
+  session        AssessmentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  question       Question          @relation(fields: [questionId], references: [id])
+  selectedOption QuestionOption?   @relation(fields: [selectedOptionId], references: [id])
+
+  @@unique([sessionId, questionId]) // one answer per question per session — re-answering updates it
+  @@index([sessionId])
+}
+
+// ============================================================================
+// SCORING ENGINE OUTPUT (FactorScore, CareerScore, CareerProfile)
+// ============================================================================
+
+model FactorScore {
+  id        String  @id @default(cuid())
+  sessionId String
+  factorId  String
+  rawScore       Decimal @db.Decimal(6, 3) // pre-normalization accumulator from assessment_engine.py
+  normalizedScore Int // 0-100, shrunk toward neutral 50 per SHRINK_K for under-measured factors
+
+  session AssessmentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  factor  AssessmentFactor  @relation(fields: [factorId], references: [id])
+
+  @@unique([sessionId, factorId])
+  @@index([sessionId])
+}
+
+enum AlignmentLabel {
+  STRONG // score >= 62 (≈ top 1% of chance-produced scores)
+  MODERATE // score >= 55 (≈ top 8%)
+  EXPLORE // below 55
+}
+
+model CareerScore {
+  id        String @id @default(cuid())
+  sessionId String
+  clusterId String
+  score     Int // 0-100, output of the W_DIMS/W_CAREER/PRIOR blend — see EngineConfig
+  alignment AlignmentLabel
+  rank      Int // 1 = strongest match in this session, for "Top 3-5 clusters" display
+
+  session AssessmentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  cluster CareerCluster     @relation(fields: [clusterId], references: [id])
+
+  @@unique([sessionId, clusterId])
+  @@index([sessionId])
+  @@index([clusterId])
+}
+
+// One generated report body per session (regeneration overwrites, versioned by engineVersion).
+model CareerProfile {
+  id        String @id @default(cuid())
+  sessionId String @unique
+
+  summary            String @db.Text // report Section 1 — plain-language profile summary
+  topInterests       Json // [{ factorId, label, score }] — report Section 2
+  personalityTraits  Json // string[] tendencies — report Section 3
+  strengths          Json // string[] — report Section 4
+  areasToDevelop     Json // string[] — report Section 5, supportive phrasing
+
+  engineVersion String // e.g. "2.0", matches question_bank.json "version" for traceability
+  generatedAt   DateTime @default(now())
+
+  session AssessmentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+}
+
+// ============================================================================
+// CAREER CLUSTERS, SCORING RULES, COURSES
+// ============================================================================
+
+model CareerCluster {
+  id          String  @id // e.g. "ENG", "CS", "MED" — matches question_bank.json clusters keys
+  name        String // e.g. "Engineering & Technology"
+  description String  @db.Text
+  isActive    Boolean @default(true)
+  order       Int     @default(0)
+
+  scoringRules    ScoringRule[]
+  careerScores    CareerScore[]
+  courseMappings  CourseClusterMapping[]
+
+  @@index([isActive, order])
+}
+
+// Configurable weights: cluster_weights[clusterId][factorId] = weight (question_bank.json).
+// Admin-editable so the recommendation engine stays "explainable" and tunable without code changes.
+model ScoringRule {
+  id            String  @id @default(cuid())
+  clusterId     String
+  factorId      String
+  weight        Decimal @db.Decimal(4, 2)
+  configVersion String  @default("v1") // allows A/B-ing weight sets without losing history
+
+  cluster CareerCluster    @relation(fields: [clusterId], references: [id], onDelete: Cascade)
+  factor  AssessmentFactor @relation(fields: [factorId], references: [id], onDelete: Cascade)
+
+  @@unique([clusterId, factorId, configVersion])
+  @@index([factorId])
+}
+
+// Global engine constants (W_DIMS, W_CAREER, W_CLUSTER, W_KEY, PRIOR, SHRINK_K, NOT_PICKED, ...)
+// from assessment_engine.py, stored as data so they're adjustable from the admin panel.
+model EngineConfig {
+  key         String  @id // e.g. "W_DIMS", "W_CAREER", "PRIOR", "SHRINK_K", "NOT_PICKED"
+  value       Decimal @db.Decimal(6, 4)
+  description String  @db.Text
+  updatedAt   DateTime @updatedAt
+}
+
+model Course {
+  id          String  @id // e.g. "CRS001" — matches programmes[].id
+  name        String // "programme" field, e.g. "B.Tech Mechanical Engineering"
+  degree      String // e.g. "B.Tech/B.E."
+  duration    String // e.g. "4 yrs"
+  eligibleStreams Stream[]
+  entranceInfo    String  @db.Text // entrance exam / admission route text
+  govtInstitutes  String? @db.Text
+  privateInstitutes String? @db.Text
+  careerPaths     String  @db.Text // example career paths text
+  skills          String  @db.Text
+  isActive        Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  keyDimensions   CourseKeyDimension[]
+  clusterMappings CourseClusterMapping[]
+
+  @@index([isActive])
+}
+
+// programmes[].key_dims — the dimensions most predictive of fit for this specific course
+// (distinct from the broader cluster-level weights), used for the 40% "programme key-dim" term.
+model CourseKeyDimension {
+  courseId String
+  factorId String
+  weight   Decimal @default(1) @db.Decimal(4, 2)
+
+  course Course           @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  factor AssessmentFactor @relation(fields: [factorId], references: [id], onDelete: Cascade)
+
+  @@id([courseId, factorId])
+  @@index([factorId])
+}
+
+// A course can be relevant to more than one career cluster (e.g. B.Sc Data Science ->
+// Technology AND Data & AI), so this is a many-to-many mapping rather than a single FK.
+model CourseClusterMapping {
+  courseId    String
+  clusterId   String
+  isPrimary   Boolean @default(true)
+  relevance   Decimal @default(1) @db.Decimal(4, 2)
+
+  course  Course        @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  cluster CareerCluster @relation(fields: [clusterId], references: [id], onDelete: Cascade)
+
+  @@id([courseId, clusterId])
+  @@index([clusterId])
+}
+
+// ============================================================================
+// REPORTS
+// ============================================================================
+
+model Report {
+  id        String  @id @default(cuid())
+  sessionId String  @unique
+
+  pdfStorageUrl String? // Vercel Blob URL once the PDF has been generated
+  shareToken    String  @unique @default(cuid()) // for "view report online" public links
+  viewCount     Int     @default(0)
+  lastViewedAt  DateTime?
+  downloadCount Int     @default(0)
+
+  generatedAt DateTime @default(now())
+
+  session AssessmentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+}
+
+// ============================================================================
+// LEADS / COUNSELLING
+// ============================================================================
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  COUNSELLING_SCHEDULED
+  COUNSELLING_COMPLETED
+  CONVERTED
+  CLOSED
+}
+
+model Lead {
+  id        String     @id @default(cuid())
+  studentId String?
+  sessionId String?
+
+  name                 String
+  mobile               String
+  email                String
+  preferredTime        String?
+  preferredCareerArea  String?
+  status               LeadStatus @default(NEW)
+  notes                String?    @db.Text
+
+  assignedAdminId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  student       Student?           @relation(fields: [studentId], references: [id], onDelete: SetNull)
+  session       AssessmentSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  assignedAdmin AdminUser?         @relation("LeadAssignedAdmin", fields: [assignedAdminId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+// ============================================================================
+// ANALYTICS (lightweight event log — powers admin dashboard funnels)
+// ============================================================================
+
+enum AnalyticsEventType {
+  LANDING_VIEWED
+  START_ASSESSMENT_CLICKED
+  REGISTRATION_COMPLETED
+  ASSESSMENT_STARTED
+  QUESTION_ANSWERED
+  ASSESSMENT_COMPLETED
+  REPORT_GENERATED
+  REPORT_DOWNLOADED
+  COURSE_VIEWED
+  COUNSELLING_CTA_CLICKED
+  LEAD_SUBMITTED
+}
+
+model AnalyticsEvent {
+  id        String             @id @default(cuid())
+  type      AnalyticsEventType
+  sessionId String?
+  metadata  Json? // small, non-PII context only (e.g. { courseId } for COURSE_VIEWED)
+  createdAt DateTime           @default(now())
+
+  session AssessmentSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  @@index([type, createdAt])
+  @@index([sessionId])
+}
